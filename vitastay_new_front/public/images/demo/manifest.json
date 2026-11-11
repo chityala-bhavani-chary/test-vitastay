@@ -1,0 +1,142 @@
+{
+  "license": "Stills try Unsplash License (https://unsplash.com/license). Fallback art and the 360 file are original Vita Stay tester assets.",
+  "exterior": [
+    {
+      "file": "exterior-1.jpg",
+      "caption": "Building facade"
+    },
+    {
+      "file": "exterior-2.jpg",
+      "caption": "Street approach"
+    },
+    {
+      "file": "exterior-3.jpg",
+      "caption": "Main gate"
+    },
+    {
+      "file": "exterior-4.jpg",
+      "caption": "Parking"
+    }
+  ],
+  "interior": [
+    {
+      "file": "interior-1.jpg",
+      "caption": "Lobby"
+    },
+    {
+      "file": "interior-2.jpg",
+      "caption": "Dining"
+    },
+    {
+      "file": "interior-3.jpg",
+      "caption": "Kitchen"
+    },
+    {
+      "file": "interior-4.jpg",
+      "caption": "Lounge"
+    },
+    {
+      "file": "interior-5.jpg",
+      "caption": "Terrace"
+    },
+    {
+      "file": "interior-6.jpg",
+      "caption": "Wash area"
+    }
+  ],
+  "room": [
+    {
+      "file": "room-1.jpg",
+      "caption": "Window"
+    },
+    {
+      "file": "room-2.jpg",
+      "caption": "Bed"
+    },
+    {
+      "file": "room-3.jpg",
+      "caption": "Bathroom"
+    },
+    {
+      "file": "room-4.jpg",
+      "caption": "Dormitory"
+    },
+    {
+      "file": "room-5.jpg",
+      "caption": "Single room"
+    },
+    {
+      "file": "room-6.jpg",
+      "caption": "Storage"
+    },
+    {
+      "file": "room-7.jpg",
+      "caption": "Corner"
+    },
+    {
+      "file": "room-8.jpg",
+      "caption": "Study desk"
+    }
+  ],
+  "floor": [
+    {
+      "file": "floor-1.jpg",
+      "caption": "Corridor"
+    },
+    {
+      "file": "floor-2.jpg",
+      "caption": "Floor lobby"
+    },
+    {
+      "file": "floor-3.jpg",
+      "caption": "Stairs"
+    },
+    {
+      "file": "floor-4.jpg",
+      "caption": "Floor wash"
+    }
+  ],
+  "panorama": [
+    {
+      "file": "pano-1.jpg",
+      "caption": "Lobby 360°"
+    }
+  ],
+  "avatar": [
+    {
+      "file": "avatar-1.jpg",
+      "caption": "Guest photo"
+    },
+    {
+      "file": "avatar-2.jpg",
+      "caption": "Staff photo"
+    }
+  ],
+  "sources": {
+    "exterior-1.jpg": "unsplash",
+    "exterior-2.jpg": "unsplash",
+    "exterior-3.jpg": "unsplash",
+    "exterior-4.jpg": "generated",
+    "interior-1.jpg": "unsplash",
+    "interior-2.jpg": "unsplash",
+    "interior-3.jpg": "unsplash",
+    "interior-4.jpg": "unsplash",
+    "interior-5.jpg": "unsplash",
+    "interior-6.jpg": "unsplash",
+    "room-1.jpg": "unsplash",
+    "room-2.jpg": "unsplash",
+    "room-3.jpg": "unsplash",
+    "room-4.jpg": "unsplash",
+    "room-5.jpg": "unsplash",
+    "room-6.jpg": "unsplash",
+    "room-7.jpg": "unsplash",
+    "room-8.jpg": "generated",
+    "floor-1.jpg": "generated",
+    "floor-2.jpg": "unsplash",
+    "floor-3.jpg": "unsplash",
+    "floor-4.jpg": "unsplash",
+    "avatar-1.jpg": "unsplash",
+    "avatar-2.jpg": "unsplash",
+    "pano-1.jpg": "generated-equirect"
+  }
+}

@@ -1,0 +1,63 @@
+module.exports = (sequelize, DataTypes) => {
+  const Hostel = sequelize.define('Hostel', {
+    id: { type: DataTypes.INTEGER.UNSIGNED, primaryKey: true, autoIncrement: true },
+    owner_id: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
+    name: { type: DataTypes.STRING(255), allowNull: false },
+    code: { type: DataTypes.STRING(50), unique: true },
+    description: DataTypes.TEXT,
+    address: { type: DataTypes.TEXT, allowNull: false },
+    city: { type: DataTypes.STRING(100), allowNull: false },
+    state: { type: DataTypes.STRING(100), allowNull: false },
+    pincode: { type: DataTypes.STRING(10), allowNull: false },
+    country: { type: DataTypes.STRING(100), defaultValue: 'India' },
+    latitude: DataTypes.DECIMAL(10, 8),
+    longitude: DataTypes.DECIMAL(11, 8),
+    total_floors: { type: DataTypes.INTEGER, defaultValue: 1 },
+    capacity: { type: DataTypes.INTEGER, defaultValue: 0 },
+    amenities: DataTypes.JSON,
+    features: {
+      type: DataTypes.JSON,
+      defaultValue: {
+        rooms: true,
+        tenants: true,
+        rent: true,
+        expenses: true,
+        visitors: true,
+        complaints: true,
+        maintenance: true,
+        notices: true,
+        staff: true,
+        attendance: true,
+        inventory: true,
+        reports: true,
+      },
+    },
+    electricity_charge: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0 },
+    water_charge: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0 },
+    security_deposit: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0 },
+    notice_period_months: { type: DataTypes.INTEGER, defaultValue: 1 },
+    images: DataTypes.JSON,
+    logo: DataTypes.STRING(255),
+    contact_phone: DataTypes.STRING(20),
+    contact_email: DataTypes.STRING(255),
+    database_name: DataTypes.STRING(64),
+    status: { type: DataTypes.ENUM('pending_approval', 'active', 'inactive', 'maintenance', 'on_hold', 'rejected'), defaultValue: 'pending_approval' },
+  }, { tableName: 'hostels' });
+
+  Hostel.associate = (models) => {
+    Hostel.belongsTo(models.User, { foreignKey: 'owner_id', as: 'owner' });
+    Hostel.hasMany(models.HostelBlock, { foreignKey: 'hostel_id', as: 'blocks' });
+    Hostel.hasMany(models.Room, { foreignKey: 'hostel_id', as: 'rooms' });
+    Hostel.hasMany(models.Tenant, { foreignKey: 'hostel_id', as: 'tenants' });
+    Hostel.hasMany(models.Staff, { foreignKey: 'hostel_id', as: 'staffMembers' });
+    Hostel.hasMany(models.Expense, { foreignKey: 'hostel_id', as: 'expenses' });
+    Hostel.hasMany(models.Visitor, { foreignKey: 'hostel_id', as: 'visitors' });
+    Hostel.hasMany(models.Complaint, { foreignKey: 'hostel_id', as: 'complaints' });
+    Hostel.hasMany(models.Maintenance, { foreignKey: 'hostel_id', as: 'maintenanceRecords' });
+    Hostel.hasMany(models.Notice, { foreignKey: 'hostel_id', as: 'notices' });
+    Hostel.hasMany(models.InventoryItem, { foreignKey: 'hostel_id', as: 'inventory' });
+    Hostel.belongsToMany(models.User, { through: models.SupervisorHostel, foreignKey: 'hostel_id', as: 'supervisors' });
+  };
+
+  return Hostel;
+};

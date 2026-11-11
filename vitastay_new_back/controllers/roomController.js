@@ -1,0 +1,478 @@
+const { Op, literal } = require('sequelize');
+const {
+  Room, Bed, Hostel, HostelBlock, User, SupervisorHostel, PropertyMedia,
+} = require('../models');
+const { success, created, paginated, error } = require('../utils/response');
+const { getPagination, getSort, buildSearchWhere } = require('../utils/pagination');
+const { getModelsForHostel } = require('../helpers/hostelContext');
+const { createAuditLog } = require('../helpers/audit');
+const masterDb = require('../models');
+const { syncRoomJsonImagesSafe } = require('../services/legacyMedia');
+
+const capacityFor = (roomType, sharingType) => {
+  const fixed = { single: 1, double: 2, triple: 3 };
+  return fixed[roomType] || Math.max(1, Number(sharingType) || 1);
+};
+
+const canAccessHostel = async (req, hostel) => {
+  if (!hostel) return true;
+  if (req.user.role === 'owner' && Number(hostel.owner_id) !== Number(req.user.id)) return false;
+  if (req.user.role === 'supervisor') {
+    const assigned = await SupervisorHostel.findOne({
+      where: { supervisor_id: req.user.id, hostel_id: hostel.id },
+    });
+    if (!assigned) return false;
+  }
+  return true;
+};
+
+/** Load a room from the right database (branch DB when hostelId is given). */
+const resolveRoom = async (req, roomId, include = () => []) => {
+  const hostelId = Number(req.query.hostelId || req.body?.hostel_id) || null;
+  if (hostelId) {
+    const ctx = await getModelsForHostel(hostelId);
+    if (!ctx.hostel) return { status: 404, message: 'Hostel not found' };
+    if (!(await canAccessHostel(req, ctx.hostel))) return { status: 403, message: 'Forbidden' };
+    const room = await ctx.models.Room.findByPk(roomId, { include: include(ctx.models) });
+    if (room) return { ctx, room, hostel: ctx.hostel };
+    if (ctx.isolated) {
+      // Rooms created before the branch got its own database still live in the master DB
+      const legacy = await Room.findOne({ where: { id: roomId, hostel_id: hostelId }, include: include(masterDb) });
+      if (legacy) return { ctx: { models: masterDb, isolated: false, hostel: ctx.hostel }, room: legacy, hostel: ctx.hostel };
+    }
+    return { status: 404, message: 'Room not found' };
+  }
+  const room = await Room.findByPk(roomId, { include: include(masterDb) });
+  if (!room) return { status: 404, message: 'Room not found' };
+  const hostel = await Hostel.findByPk(room.hostel_id);
+  if (!(await canAccessHostel(req, hostel))) return { status: 403, message: 'Forbidden' };
+  return { ctx: { models: masterDb, isolated: false, hostel }, room, hostel };
+};
+
+/** Tenants currently staying in a room: on one of its beds, or assigned to the room without a bed. */
+const tenantsInRoom = async (models, roomId) => {
+  if (!models.Tenant) return [];
+  const beds = await models.Bed.findAll({ where: { room_id: roomId }, attributes: ['id'] });
+  const bedIds = beds.map((b) => b.id);
+  const placement = [{ room_id: roomId, bed_id: null }];
+  if (bedIds.length) placement.push({ bed_id: { [Op.in]: bedIds } });
+  return models.Tenant.findAll({
+    where: { [Op.or]: placement, status: { [Op.ne]: 'moved_out' } },
+    order: [['id', 'ASC']],
+  });
+};
+
+const userNames = async (ids) => {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (!unique.length) return new Map();
+  const users = await User.findAll({
+    where: { id: unique },
+    attributes: ['id', 'first_name', 'last_name', 'email', 'phone', 'avatar'],
+  });
+  return new Map(users.map((u) => [u.id, u]));
+};
+
+const withDeactivatedBy = async (rows) => {
+  const users = new Map();
+  return rows.map((row) => {
+    const user = users.get(row.deactivated_by);
+    return {
+      ...row,
+      deactivatedBy: user ? `${user.first_name || ''} ${user.last_name || ''}`.trim() : null,
+    };
+  });
+};
+
+/**
+ * Add or remove beds so a room matches its capacity after a type change.
+ * Only empty beds are removed; returns an error message when that is not possible.
+ */
+const syncBedsToCapacity = async (models, room, capacity) => {
+  const beds = await models.Bed.findAll({ where: { room_id: room.id } });
+  if (beds.length === capacity) return null;
+
+  if (beds.length < capacity) {
+    const taken = new Set(beds.map((b) => String(b.bed_number)));
+    const additions = [];
+    let n = 1;
+    while (beds.length + additions.length < capacity) {
+      if (!taken.has(String(n))) additions.push({ room_id: room.id, bed_number: String(n), status: 'vacant' });
+      n += 1;
+    }
+    await models.Bed.bulkCreate(additions);
+    return null;
+  }
+
+  const staying = await tenantsInRoom(models, room.id);
+  const busyBedIds = new Set(staying.map((t) => t.bed_id).filter(Boolean));
+  const removable = beds
+    .filter((b) => b.status === 'vacant' && !busyBedIds.has(b.id))
+    .sort((a, b) => String(b.bed_number).localeCompare(String(a.bed_number), undefined, { numeric: true }));
+  const excess = beds.length - capacity;
+  if (removable.length < excess) {
+    return `Room ${room.room_number} has ${beds.length - removable.length} bed(s) in use. Free them before reducing it to ${capacity} bed(s).`;
+  }
+  await models.Bed.destroy({ where: { id: removable.slice(0, excess).map((b) => b.id) } });
+  return null;
+};
+
+const createBedsForRoom = async (BedModel, room, sharingType) => {
+  const beds = [];
+  for (let i = 1; i <= sharingType; i++) {
+    beds.push({ room_id: room.id, bed_number: String(i), status: 'vacant' });
+  }
+  await BedModel.bulkCreate(beds);
+};
+
+const ROOM_ORDER = [['floor', 'ASC'], ['room_number', 'ASC']];
+
+const applyRoomFilters = (where, query) => {
+  if (query.status) where.status = query.status;
+  if (query.floor) where.floor = Number(query.floor);
+  if (query.roomType) where.room_type = query.roomType;
+  if (query.search) Object.assign(where, buildSearchWhere(query.search, ['room_number']));
+  if (query.availability === 'available') {
+    where.id = { [Op.in]: literal("(SELECT room_id FROM beds WHERE status = 'vacant')") };
+  } else if (query.availability === 'full') {
+    where.id = { [Op.notIn]: literal("(SELECT room_id FROM beds WHERE status = 'vacant')") };
+  }
+  return where;
+};
+
+const roomOrder = (query) => (query.sortBy ? getSort(query, ['room_number', 'floor', 'created_at']) : ROOM_ORDER);
+
+exports.getAll = async (req, res, next) => {
+  try {
+    const { page, limit, offset } = getPagination(req.query);
+    const hostelId = req.query.hostelId ? Number(req.query.hostelId) : null;
+
+    // Branch-isolated read: never mix rooms across branch databases
+    if (hostelId) {
+      const ctx = await getModelsForHostel(hostelId);
+      if (!ctx.hostel) return error(res, 'Hostel not found', 404);
+      if (ctx.hostel.status === 'pending_approval') {
+        return paginated(res, [], { page, limit, total: 0 });
+      }
+
+      const where = applyRoomFilters(ctx.isolated ? {} : { hostel_id: hostelId }, req.query);
+
+      const RoomModel = ctx.models.Room;
+      const BedModel = ctx.models.Bed;
+      const BlockModel = ctx.models.HostelBlock;
+
+      const { count, rows } = await RoomModel.findAndCountAll({
+        where,
+        include: [
+          { model: BedModel, as: 'beds', required: false },
+          { model: BlockModel, as: 'block', attributes: ['id', 'name'], required: false },
+        ],
+        order: roomOrder(req.query),
+        distinct: true,
+        limit,
+        offset,
+      });
+
+      const withHostel = rows.map((r) => {
+        const json = r.toJSON();
+        json.hostel = { id: ctx.hostel.id, name: ctx.hostel.name, database_name: ctx.databaseName };
+        return json;
+      });
+
+      return paginated(res, await withDeactivatedBy(withHostel), { page, limit, total: count });
+    }
+
+    // Fallback: master DB (legacy hostels without dedicated DB)
+    const where = applyRoomFilters({}, req.query);
+
+    const { count, rows } = await Room.findAndCountAll({
+      where,
+      include: [
+        { model: Hostel, as: 'hostel', attributes: ['id', 'name', 'database_name'] },
+        { model: Bed, as: 'beds' },
+        { model: HostelBlock, as: 'block', attributes: ['id', 'name'] },
+      ],
+      order: roomOrder(req.query),
+      distinct: true,
+      limit,
+      offset,
+    });
+
+    return paginated(res, await withDeactivatedBy(rows.map((r) => r.toJSON())), { page, limit, total: count });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getById = async (req, res, next) => {
+  try {
+    const found = await resolveRoom(req, req.params.id, (models) => [
+      { model: models.Bed, as: 'beds', required: false },
+      { model: models.HostelBlock, as: 'block', required: false },
+    ]);
+    if (!found.room) return error(res, found.message, found.status);
+    return success(res, found.room);
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.create = async (req, res, next) => {
+  try {
+    const hostelId = Number(req.body.hostel_id);
+    if (!hostelId) return error(res, 'hostel_id is required', 400);
+
+    const catalogHostel = await masterDb.Hostel.findByPk(hostelId);
+    if (!catalogHostel) return error(res, 'Hostel not found', 404);
+    if (catalogHostel.status === 'pending_approval') {
+      return error(res, 'Hostel/branch is awaiting Super Admin approval', 403);
+    }
+    if (!catalogHostel.database_name && catalogHostel.status === 'active') {
+      // Legacy hostel without DB — use master
+    }
+
+    const maxFloors = Math.max(Number(catalogHostel.total_floors) || 1, 1);
+    const floor = Number(req.body.floor);
+    if (!Number.isInteger(floor) || floor < 1 || floor > maxFloors) {
+      return error(res, `Floor must be between 1 and ${maxFloors}, the limit set for this hostel`, 400);
+    }
+
+    const sharingMap = { single: 1, double: 2, triple: 3, dormitory: req.body.sharing_type || 6 };
+    const sharingType = sharingMap[req.body.room_type] || 1;
+    req.body.sharing_type = sharingType;
+    if (req.files?.length) {
+      req.body.images = req.files.map((f) => `/uploads/rooms/${f.filename}`);
+    }
+
+    const ctx = await getModelsForHostel(catalogHostel);
+    const payload = {
+      ...req.body,
+      hostel_id: hostelId,
+    };
+
+    const room = await ctx.models.Room.create(payload);
+    await syncRoomJsonImagesSafe(catalogHostel, room, { uploadedBy: req.user.id });
+    await createBedsForRoom(ctx.models.Bed, room, sharingType);
+    const result = await ctx.models.Room.findByPk(room.id, {
+      include: [{ model: ctx.models.Bed, as: 'beds', required: false }],
+    });
+    require('../services/occupancySnapshot').scheduleOccupancyRefresh(hostelId);
+    require('../services/listingProjection').scheduleListingRefresh(hostelId);
+    return created(res, result, ctx.isolated
+      ? `Room created in branch database "${ctx.databaseName}"`
+      : 'Room created successfully');
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.update = async (req, res, next) => {
+  try {
+    const found = await resolveRoom(req, req.params.id);
+    if (!found.room) return error(res, found.message, found.status);
+    const { ctx, room, hostel } = found;
+
+    const payload = { ...req.body };
+    ['id', 'hostel_id', 'beds', 'block', 'hostel']
+      .forEach((key) => delete payload[key]);
+
+    if (payload.floor !== undefined && Number(payload.floor) !== Number(room.floor)) {
+      const maxFloors = Math.max(Number(hostel?.total_floors) || 1, 1);
+      const floor = Number(payload.floor);
+      if (!Number.isInteger(floor) || floor < 1 || floor > maxFloors) {
+        return error(res, `Floor must be between 1 and ${maxFloors}, the limit set for this hostel`, 400);
+      }
+      payload.floor = floor;
+    }
+
+    if (payload.room_number !== undefined && String(payload.room_number) !== String(room.room_number)) {
+      const clash = await ctx.models.Room.findOne({
+        where: {
+          room_number: String(payload.room_number),
+          id: { [Op.ne]: room.id },
+          ...(ctx.isolated ? {} : { hostel_id: room.hostel_id }),
+        },
+      });
+      if (clash) return error(res, `Room number ${payload.room_number} already exists in this hostel`, 409);
+    }
+
+    const nextType = payload.room_type || room.room_type;
+    const nextCapacity = capacityFor(nextType, payload.sharing_type ?? room.sharing_type);
+    payload.sharing_type = nextCapacity;
+    if (nextCapacity !== capacityFor(room.room_type, room.sharing_type)) {
+      const bedError = await syncBedsToCapacity(ctx.models, room, nextCapacity);
+      if (bedError) return error(res, bedError, 400);
+    }
+
+    if (req.files?.length) {
+      payload.images = [...(room.images || []), ...req.files.map((f) => `/uploads/rooms/${f.filename}`)];
+    }
+    await room.update(payload);
+    await syncRoomJsonImagesSafe(hostel, room, { uploadedBy: req.user.id });
+    const result = await ctx.models.Room.findByPk(room.id, {
+      include: [{ model: ctx.models.Bed, as: 'beds', required: false }],
+    });
+    require('../services/occupancySnapshot').scheduleOccupancyRefresh(room.hostel_id);
+    require('../services/listingProjection').scheduleListingRefresh(room.hostel_id);
+    return success(res, result, 'Room updated successfully');
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.setActive = async (req, res, next) => {
+  try {
+    const found = await resolveRoom(req, req.params.id);
+    if (!found.room) return error(res, found.message, found.status);
+    const { ctx, room } = found;
+    const makeActive = req.body.is_active === true || req.body.is_active === 'true';
+
+    if (!makeActive) {
+      const staying = await tenantsInRoom(ctx.models, room.id);
+      if (staying.length) {
+        return error(
+          res,
+          `Room ${room.room_number} has ${staying.length} tenant${staying.length === 1 ? '' : 's'} staying. Transfer or move them out before making it inactive.`,
+          409
+        );
+      }
+      const busyBeds = await ctx.models.Bed.count({
+        where: { room_id: room.id, status: { [Op.in]: ['occupied', 'reserved'] } },
+      });
+      if (busyBeds) {
+        return error(res, `Room ${room.room_number} has ${busyBeds} occupied or reserved bed(s). Free them before making it inactive.`, 409);
+      }
+    }
+
+    const before = { is_active: room.is_active, deactivation_reason: room.deactivation_reason };
+    await room.update(makeActive
+      ? { is_active: true, deactivated_at: null, deactivation_reason: null, deactivated_by: null }
+      : {
+        is_active: false,
+        deactivated_at: new Date(),
+        deactivation_reason: String(req.body.reason || '').trim().slice(0, 255) || null,
+        deactivated_by: req.user.id,
+      });
+
+    await createAuditLog({
+      userId: req.user.id,
+      action: makeActive ? 'room_activated' : 'room_deactivated',
+      entityType: 'room',
+      entityId: room.id,
+      oldValues: before,
+      newValues: { is_active: room.is_active, deactivation_reason: room.deactivation_reason },
+      req,
+    });
+
+    return success(res, room, makeActive
+      ? `Room ${room.room_number} is active again`
+      : `Room ${room.room_number} moved to inactive`);
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.details = async (req, res, next) => {
+  try {
+    const found = await resolveRoom(req, req.params.id, (models) => [
+      { model: models.Bed, as: 'beds', required: false },
+      { model: models.HostelBlock, as: 'block', attributes: ['id', 'name'], required: false },
+    ]);
+    if (!found.room) return error(res, found.message, found.status);
+    const { ctx, room, hostel } = found;
+
+    const tenants = await tenantsInRoom(ctx.models, room.id);
+    const users = await userNames(tenants.map((t) => t.user_id));
+    const json = room.toJSON();
+    const bedNumber = new Map((json.beds || []).map((b) => [b.id, b.bed_number]));
+
+    const occupants = tenants.map((t) => {
+      const user = users.get(t.user_id);
+      const name = t.full_name || (user ? `${user.first_name || ''} ${user.last_name || ''}`.trim() : '');
+      return {
+        id: t.id,
+        full_name: name || 'Unnamed tenant',
+        gender: t.gender,
+        date_of_birth: t.date_of_birth,
+        photo: t.photo || user?.avatar || null,
+        phone: user?.phone || t.alternate_phone || null,
+        email: user?.email || null,
+        bed_id: t.bed_id,
+        bed_number: t.bed_id ? bedNumber.get(t.bed_id) : null,
+        move_in_date: t.move_in_date,
+        monthly_rent: t.monthly_rent,
+        deposit_amount: t.deposit_amount,
+        occupation: t.company || t.college || null,
+        is_student: t.is_student,
+        status: t.status,
+      };
+    });
+
+    const byBed = new Map(occupants.filter((o) => o.bed_id).map((o) => [o.bed_id, o]));
+    json.beds = (json.beds || [])
+      .sort((a, b) => String(a.bed_number).localeCompare(String(b.bed_number), undefined, { numeric: true }))
+      .map((bed) => ({ ...bed, occupant: byBed.get(bed.id) || null }));
+    json.capacity = capacityFor(json.room_type, json.sharing_type);
+    json.hostel = hostel
+      ? { id: hostel.id, name: hostel.name, logo: hostel.logo, total_floors: hostel.total_floors, city: hostel.city }
+      : null;
+    json.occupants = occupants;
+    const [withName] = await withDeactivatedBy([json]);
+    return success(res, withName);
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.remove = async (req, res, next) => {
+  try {
+    const hostelId = req.query.hostelId ? Number(req.query.hostelId) : null;
+    let room;
+    if (hostelId) {
+      const ctx = await getModelsForHostel(hostelId);
+      room = await ctx.models.Room.findByPk(req.params.id);
+    } else {
+      room = await Room.findByPk(req.params.id);
+    }
+    if (!room) return error(res, 'Room not found', 404);
+    const hostelIdForMedia = room.hostel_id;
+    const roomId = room.id;
+    await room.destroy();
+    await PropertyMedia.destroy({ where: { hostel_id: hostelIdForMedia, room_id: roomId } });
+    return success(res, null, 'Room deleted successfully');
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getVacant = async (req, res, next) => {
+  try {
+    const hostelId = req.query.hostelId ? Number(req.query.hostelId) : null;
+
+    if (hostelId) {
+      const ctx = await getModelsForHostel(hostelId);
+      if (!ctx.hostel) return error(res, 'Hostel not found', 404);
+
+      const where = { status: 'vacant', ...(ctx.isolated ? {} : { hostel_id: hostelId }) };
+      const rooms = await ctx.models.Room.findAll({
+        where,
+        include: [{ model: ctx.models.Bed, as: 'beds', required: false }],
+        order: [['room_number', 'ASC']],
+      });
+      return success(res, rooms);
+    }
+
+    const where = { status: 'vacant' };
+    if (req.query.floor) where.floor = req.query.floor;
+    const rooms = await Room.findAll({
+      where,
+      include: [
+        { model: Hostel, as: 'hostel', attributes: ['id', 'name'] },
+        { model: Bed, as: 'beds' },
+      ],
+      order: [['room_number', 'ASC']],
+    });
+    return success(res, rooms);
+  } catch (err) {
+    next(err);
+  }
+};
