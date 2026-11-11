@@ -1,0 +1,92 @@
+# Optional local stack: MySQL + API + nginx/front.
+# Native Windows Node + MySQL stays the default. Do not use this as a production
+# topology if you already run VMs / nginx / PM2 (see docs/12-deployment-guide.md).
+#
+#   docker compose up --build
+#   open http://localhost:8080
+#
+# Host ports: web 8080, MySQL 3307 (3306 is left for a native MariaDB/MySQL).
+# Named volumes: vitastay_mysql, vitastay_uploads.
+
+name: vitastay
+
+services:
+  mysql:
+    image: mysql:8.0
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: nivas_hostel
+      MYSQL_USER: nivas_user
+      MYSQL_PASSWORD: nivas_pass
+      MYSQL_ROOT_PASSWORD: vitastay_root
+    volumes:
+      - vitastay_mysql:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pvitastay_root"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./vitastay_new_back
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: development
+      PORT: 5000
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: nivas_hostel
+      DB_USER: nivas_user
+      DB_PASSWORD: nivas_pass
+      MYSQL_ROOT_USER: root
+      MYSQL_ROOT_PASSWORD: vitastay_root
+      JWT_SECRET: docker-compose-dev-jwt-secret-not-for-prod
+      JWT_REFRESH_SECRET: docker-compose-dev-refresh-secret-ok
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      APP_URL: http://localhost:8080
+      API_URL: http://localhost:8080
+      CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+      PAYMENT_GATEWAY: mock
+      SMTP_FROM: Vita Stay <noreply@vitastay.com>
+    volumes:
+      - vitastay_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:5000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 25s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./vitastay_new_front
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  vitastay_mysql:
+  vitastay_uploads:

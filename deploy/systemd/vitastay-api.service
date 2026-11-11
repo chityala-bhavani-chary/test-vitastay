@@ -1,0 +1,19 @@
+[Unit]
+Description=Vita Stay API
+After=network.target mariadb.service mysql.service
+Wants=mariadb.service mysql.service
+
+[Service]
+Type=simple
+User=vitastay
+Group=vitastay
+WorkingDirectory=/var/www/vitastay/vitastay_new_back
+EnvironmentFile=/etc/vitastay/api.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+# uploads and KYC stay on disk — do not start a second replica without shared storage
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

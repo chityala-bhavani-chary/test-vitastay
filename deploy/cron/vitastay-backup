@@ -1,0 +1,4 @@
+# Install: sudo cp deploy/cron/vitastay-backup /etc/cron.d/vitastay-backup
+# Nightly 02:15 — master DB + vitastay_* + uploads. Keep 14 days.
+15 2 * * * vitastay cd /var/www/vitastay/vitastay_new_back && /usr/bin/node scripts/backup.js --out /var/backups/vitastay >> /var/log/vitastay/backup.log 2>&1
+20 3 * * * vitastay find /var/backups/vitastay -mindepth 1 -maxdepth 1 -mtime +14 -exec rm -rf {} +
